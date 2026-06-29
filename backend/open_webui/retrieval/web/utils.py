@@ -1,4 +1,5 @@
 import asyncio
+from enum import Enum
 import ipaddress
 import logging
 import socket
@@ -41,6 +42,7 @@ from open_webui.config import (
     MICROSOFT_WEB_IQ_LANGUAGE,
     PLAYWRIGHT_TIMEOUT,
     PLAYWRIGHT_WS_URL,
+    PLAYWRIGHT_BROWSER_TYPE,
     TAVILY_API_KEY,
     TAVILY_EXTRACT_DEPTH,
     WEB_FETCH_FILTER_LIST,
@@ -541,6 +543,11 @@ class SafeMicrosoftWebIQLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
             else:
                 raise e
 
+class PlaywrightBrowserType(str, Enum):
+    CHROMIUM = "chromium"
+    FIREFOX = "firefox"
+    WEBKIT = "webkit"
+
 
 class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessingMixin):
     """Load HTML pages safely with Playwright, supporting SSL verification, rate limiting, and remote browser connection.
@@ -569,6 +576,7 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         proxy: Optional[Dict[str, str]] = None,
         playwright_ws_url: Optional[str] = None,
         playwright_timeout: Optional[int] = 10000,
+        playwright_browser_type: str = "chromium",
     ):
         """Initialize with additional safety parameters and remote browser support."""
 
@@ -596,6 +604,22 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         self.playwright_ws_url = playwright_ws_url
         self.trust_env = trust_env
         self.playwright_timeout = playwright_timeout
+
+        try:
+            b_type = PlaywrightBrowserType(playwright_browser_type.lower()) if playwright_browser_type else PlaywrightBrowserType.CHROMIUM
+        except ValueError:
+            log.warning(
+                f"Unsupported Playwright browser type '{playwright_browser_type}'. Falling back to 'chromium'."
+            )
+            b_type = PlaywrightBrowserType.CHROMIUM
+        self.playwright_browser_type = b_type
+
+    def _get_browser_impl(self, p: Any) -> Any:
+        if self.playwright_browser_type == PlaywrightBrowserType.FIREFOX:
+            return p.firefox
+        elif self.playwright_browser_type == PlaywrightBrowserType.WEBKIT:
+            return p.webkit
+        return p.chromium
 
     def _intercept_navigation_sync(self, route, request=None):
         req = request or route.request
@@ -659,10 +683,11 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
 
         with sync_playwright() as p:
             # Use remote browser if ws_endpoint is provided, otherwise use local browser
+            browser_impl = self._get_browser_impl(p)
             if self.playwright_ws_url:
-                browser = p.chromium.connect(self.playwright_ws_url)
+                browser = browser_impl.connect(self.playwright_ws_url)
             else:
-                browser = p.chromium.launch(headless=self.headless, proxy=self.proxy)
+                browser = browser_impl.launch(headless=self.headless, proxy=self.proxy)
 
             for url in self.urls:
                 try:
@@ -689,10 +714,11 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
 
         async with async_playwright() as p:
             # Use remote browser if ws_endpoint is provided, otherwise use local browser
+            browser_impl = self._get_browser_impl(p)
             if self.playwright_ws_url:
-                browser = await p.chromium.connect(self.playwright_ws_url)
+                browser = await browser_impl.connect(self.playwright_ws_url)
             else:
-                browser = await p.chromium.launch(headless=self.headless, proxy=self.proxy)
+                browser = await browser_impl.launch(headless=self.headless, proxy=self.proxy)
 
             for url in self.urls:
                 try:
@@ -873,6 +899,7 @@ def get_web_loader(
     if WEB_LOADER_ENGINE == 'playwright':
         WebLoaderClass = SafePlaywrightURLLoader
         web_loader_args['playwright_timeout'] = PLAYWRIGHT_TIMEOUT
+        web_loader_args['playwright_browser_type'] = PLAYWRIGHT_BROWSER_TYPE
         if PLAYWRIGHT_WS_URL:
             web_loader_args['playwright_ws_url'] = PLAYWRIGHT_WS_URL
 
