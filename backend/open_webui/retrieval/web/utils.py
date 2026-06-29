@@ -586,8 +586,30 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                     raise e
             browser.close()
 
+    async def _fetch_single_url_async(self, browser: Any, url: str) -> Optional[Document]:
+        page = None
+        try:
+            await self._safe_process_url(url)
+            page = await browser.new_page()
+            await page.route('**/*', self._intercept_navigation)
+            response = await page.goto(url, timeout=self.playwright_timeout)
+            if response is None:
+                raise ValueError(f'page.goto() returned None for url {url}')
+
+            text = await self.evaluator.evaluate_async(page, browser, response)
+            metadata = {'source': url}
+            return Document(page_content=text, metadata=metadata)
+        except Exception as e:
+            if self.continue_on_failure:
+                log.exception(f'Error loading {url}: {e}')
+                return None
+            raise e
+        finally:
+            if page:
+                await page.close()
+
     async def alazy_load(self) -> AsyncIterator[Document]:
-        """Safely load URLs asynchronously with support for remote browser."""
+        """Safely load URLs asynchronously in parallel."""
         from playwright.async_api import async_playwright
 
         async with async_playwright() as p:
@@ -597,23 +619,11 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
             else:
                 browser = await p.chromium.launch(headless=self.headless, proxy=self.proxy)
 
-            for url in self.urls:
-                try:
-                    await self._safe_process_url(url)
-                    page = await browser.new_page()
-                    await page.route('**/*', self._intercept_navigation)
-                    response = await page.goto(url, timeout=self.playwright_timeout)
-                    if response is None:
-                        raise ValueError(f'page.goto() returned None for url {url}')
-
-                    text = await self.evaluator.evaluate_async(page, browser, response)
-                    metadata = {'source': url}
-                    yield Document(page_content=text, metadata=metadata)
-                except Exception as e:
-                    if self.continue_on_failure:
-                        log.exception(f'Error loading {url}: {e}')
-                        continue
-                    raise e
+            tasks = [self._fetch_single_url_async(browser, url) for url in self.urls]
+            for task in asyncio.as_completed(tasks):
+                doc = await task
+                if doc is not None:
+                    yield doc
             await browser.close()
 
 
