@@ -598,11 +598,80 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                     self._safe_process_url_sync(url)
                     page = browser.new_page()
                     page.route('**/*', self._intercept_navigation_sync)
-                    response = page.goto(url, timeout=self.playwright_timeout)
+                    # Navigate waiting only for domcontentloaded to get control as fast as possible
+                    response = page.goto(
+                        url,
+                        timeout=self.playwright_timeout,
+                        wait_until="domcontentloaded",
+                    )
+
                     if response is None:
                         raise ValueError(f'page.goto() returned None for url {url}')
 
-                    text = self.evaluator.evaluate(page, browser, response)
+                    # Get initial text immediately to bypass loop overhead for static pages
+                    try:
+                        current_text = page.evaluate('() => document.body ? document.body.innerText : ""')
+                    except Exception:
+                        current_text = ""
+
+                    current_len = len(current_text)
+                    loading_phrases = [
+                        # English
+                        "loading", "please wait", "verifying your browser", 
+                        "checking your browser", "just a moment", "one moment",
+                        # Spanish / Portuguese / Italian
+                        "cargando", "carregando", "caricamento", "esperando", "aguarde", "attendere",
+                        # French
+                        "chargement", "patienter",
+                        # German / Dutch
+                        "laden", "warten", "geduld",
+                        # Polish / Russian / Ukrainian
+                        "ładowanie", "загрузка", "подождите", "завантаження",
+                        # Chinese / Japanese / Korean
+                        "加载中", "載入中", "読み込み", "로딩", "기다려",
+                        # Arabic / Hebrew / Persian
+                        "تحميل", "الانتظار", "טוען", "بارگذاری",
+                        # Hindi / Thai / Turkish / Vietnamese / Indonesian
+                        "लोड", "กำลังโหลด", "yükleniyor", "đang tải", "memuat",
+                        # Scandinavian / Finnish
+                        "laddar", "laster", "indlæser", "ladataan",
+                        # Czech / Slovak / Greek
+                        "načítání", "načítanie", "φόρτωση"
+                    ]
+                    current_text_lower = current_text.lower()
+                    is_loading = (
+                        current_len < 500 
+                        and any(phrase in current_text_lower for phrase in loading_phrases)
+                    )
+
+                    # If the page already has content and is not a loading screen, resolve immediately!
+                    if current_len > 0 and not is_loading:
+                        text = current_text
+                    else:
+                        # Otherwise (empty DOM or loading screen), enter dynamic stability loop
+                        import time as time_mod
+                        last_text_len = current_len
+                        start_wait = time_mod.time()
+                        max_wait_seconds = 5.0
+                        while (time_mod.time() - start_wait) < max_wait_seconds:
+                            try:
+                                current_text = page.evaluate('() => document.body ? document.body.innerText : ""')
+                            except Exception:
+                                current_text = ""
+                            current_len = len(current_text)
+                            current_text_lower = current_text.lower()
+                            is_loading = (
+                                current_len < 500 
+                                and any(phrase in current_text_lower for phrase in loading_phrases)
+                            )
+                            if current_len > 0 and current_len == last_text_len and not is_loading:
+                                break
+                            last_text_len = current_len
+                            page.wait_for_timeout(500)
+                        text = current_text
+
+                    if not text:
+                        text = self.evaluator.evaluate(page, browser, response)
                     metadata = {'source': url}
                     yield Document(page_content=text, metadata=metadata)
                 except Exception as e:
@@ -629,11 +698,80 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                     await self._safe_process_url(url)
                     page = await browser.new_page()
                     await page.route('**/*', self._intercept_navigation)
-                    response = await page.goto(url, timeout=self.playwright_timeout)
+                    # Navigate waiting only for domcontentloaded to get control as fast as possible
+                    response = await page.goto(
+                        url,
+                        timeout=self.playwright_timeout,
+                        wait_until="domcontentloaded",
+                    )
+
                     if response is None:
                         raise ValueError(f'page.goto() returned None for url {url}')
 
-                    text = await self.evaluator.evaluate_async(page, browser, response)
+                    # Get initial text immediately to bypass loop overhead for static pages
+                    try:
+                        current_text = await page.evaluate('() => document.body ? document.body.innerText : ""')
+                    except Exception:
+                        current_text = ""
+
+                    current_len = len(current_text)
+                    loading_phrases = [
+                        # English
+                        "loading", "please wait", "verifying your browser", 
+                        "checking your browser", "just a moment", "one moment",
+                        # Spanish / Portuguese / Italian
+                        "cargando", "carregando", "caricamento", "esperando", "aguarde", "attendere",
+                        # French
+                        "chargement", "patienter",
+                        # German / Dutch
+                        "laden", "warten", "geduld",
+                        # Polish / Russian / Ukrainian
+                        "ładowanie", "загрузка", "подождите", "завантаження",
+                        # Chinese / Japanese / Korean
+                        "加载中", "載入中", "読み込み", "로딩", "기다려",
+                        # Arabic / Hebrew / Persian
+                        "تحميل", "الانتظار", "טועன்", "بارگذاری",
+                        # Hindi / Thai / Turkish / Vietnamese / Indonesian
+                        "लोड", "กำลังโหลด", "yükleniyor", "đang tải", "memuat",
+                        # Scandinavian / Finnish
+                        "laddar", "laster", "indlæser", "ladataan",
+                        # Czech / Slovak / Greek
+                        "načítání", "načítanie", "φόρτωση"
+                    ]
+                    current_text_lower = current_text.lower()
+                    is_loading = (
+                        current_len < 500 
+                        and any(phrase in current_text_lower for phrase in loading_phrases)
+                    )
+
+                    # If the page already has content and is not a loading screen, resolve immediately!
+                    if current_len > 0 and not is_loading:
+                        text = current_text
+                    else:
+                        # Otherwise (empty DOM or loading screen), enter dynamic stability loop
+                        import time as time_mod
+                        last_text_len = current_len
+                        start_wait = time_mod.time()
+                        max_wait_seconds = 5.0
+                        while (time_mod.time() - start_wait) < max_wait_seconds:
+                            try:
+                                current_text = await page.evaluate('() => document.body ? document.body.innerText : ""')
+                            except Exception:
+                                current_text = ""
+                            current_len = len(current_text)
+                            current_text_lower = current_text.lower()
+                            is_loading = (
+                                current_len < 500 
+                                and any(phrase in current_text_lower for phrase in loading_phrases)
+                            )
+                            if current_len > 0 and current_len == last_text_len and not is_loading:
+                                break
+                            last_text_len = current_len
+                            await page.wait_for_timeout(500)
+                        text = current_text
+
+                    if not text:
+                        text = await self.evaluator.evaluate_async(page, browser, response)
                     metadata = {'source': url}
                     yield Document(page_content=text, metadata=metadata)
                 except Exception as e:
