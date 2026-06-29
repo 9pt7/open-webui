@@ -1861,6 +1861,12 @@ PLAYWRIGHT_TIMEOUT = ConfigVar(
     int(os.getenv('PLAYWRIGHT_TIMEOUT', '10000')),
 )
 
+PLAYWRIGHT_BROWSER_TYPE = ConfigVar(
+    'PLAYWRIGHT_BROWSER_TYPE',
+    'rag.web.loader.playwright_browser_type',
+    os.getenv('PLAYWRIGHT_BROWSER_TYPE', 'chromium'),
+)
+
 FIRECRAWL_API_KEY = ConfigVar(
     'FIRECRAWL_API_KEY',
     'rag.web.loader.firecrawl_api_key',
