@@ -1,4 +1,5 @@
 import asyncio
+from enum import Enum
 import ipaddress
 import logging
 import socket
@@ -39,6 +40,7 @@ from open_webui.config import (
     FIRECRAWL_TIMEOUT,
     PLAYWRIGHT_TIMEOUT,
     PLAYWRIGHT_WS_URL,
+    PLAYWRIGHT_BROWSER_TYPE,
     TAVILY_API_KEY,
     TAVILY_EXTRACT_DEPTH,
     WEB_FETCH_FILTER_LIST,
@@ -445,6 +447,12 @@ class SafeTavilyLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
                 raise e
 
 
+class PlaywrightBrowserType(str, Enum):
+    CHROMIUM = "chromium"
+    FIREFOX = "firefox"
+    WEBKIT = "webkit"
+
+
 class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessingMixin):
     """Load HTML pages safely with Playwright, supporting SSL verification, rate limiting, and remote browser connection.
 
@@ -472,6 +480,7 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         proxy: Optional[Dict[str, str]] = None,
         playwright_ws_url: Optional[str] = None,
         playwright_timeout: Optional[int] = 10000,
+        playwright_browser_type: str = "chromium",
     ):
         """Initialize with additional safety parameters and remote browser support."""
 
@@ -499,6 +508,22 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         self.playwright_ws_url = playwright_ws_url
         self.trust_env = trust_env
         self.playwright_timeout = playwright_timeout
+
+        try:
+            b_type = PlaywrightBrowserType(playwright_browser_type.lower()) if playwright_browser_type else PlaywrightBrowserType.CHROMIUM
+        except ValueError:
+            log.warning(
+                f"Unsupported Playwright browser type '{playwright_browser_type}'. Falling back to 'chromium'."
+            )
+            b_type = PlaywrightBrowserType.CHROMIUM
+        self.playwright_browser_type = b_type
+
+    def _get_browser_impl(self, p: Any) -> Any:
+        if self.playwright_browser_type == PlaywrightBrowserType.FIREFOX:
+            return p.firefox
+        elif self.playwright_browser_type == PlaywrightBrowserType.WEBKIT:
+            return p.webkit
+        return p.chromium
 
     def _intercept_navigation_sync(self, route, request=None):
         req = request or route.request
@@ -562,21 +587,91 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
 
         with sync_playwright() as p:
             # Use remote browser if ws_endpoint is provided, otherwise use local browser
+            browser_impl = self._get_browser_impl(p)
             if self.playwright_ws_url:
-                browser = p.chromium.connect(self.playwright_ws_url)
+                browser = browser_impl.connect(self.playwright_ws_url)
             else:
-                browser = p.chromium.launch(headless=self.headless, proxy=self.proxy)
+                browser = browser_impl.launch(headless=self.headless, proxy=self.proxy)
 
             for url in self.urls:
                 try:
                     self._safe_process_url_sync(url)
                     page = browser.new_page()
                     page.route('**/*', self._intercept_navigation_sync)
-                    response = page.goto(url, timeout=self.playwright_timeout)
+                    # Navigate waiting only for domcontentloaded to get control as fast as possible
+                    response = page.goto(
+                        url,
+                        timeout=self.playwright_timeout,
+                        wait_until="domcontentloaded",
+                    )
+
                     if response is None:
                         raise ValueError(f'page.goto() returned None for url {url}')
 
-                    text = self.evaluator.evaluate(page, browser, response)
+                    # Get initial text immediately to bypass loop overhead for static pages
+                    try:
+                        current_text = page.evaluate('() => document.body ? document.body.innerText : ""')
+                    except Exception:
+                        current_text = ""
+
+                    current_len = len(current_text)
+                    loading_phrases = [
+                        # English
+                        "loading", "please wait", "verifying your browser", 
+                        "checking your browser", "just a moment", "one moment",
+                        # Spanish / Portuguese / Italian
+                        "cargando", "carregando", "caricamento", "esperando", "aguarde", "attendere",
+                        # French
+                        "chargement", "patienter",
+                        # German / Dutch
+                        "laden", "warten", "geduld",
+                        # Polish / Russian / Ukrainian
+                        "ładowanie", "загрузка", "подождите", "завантаження",
+                        # Chinese / Japanese / Korean
+                        "加载中", "載入中", "読み込み", "로딩", "기다려",
+                        # Arabic / Hebrew / Persian
+                        "تحميل", "الانتظار", "טוען", "بارگذاری",
+                        # Hindi / Thai / Turkish / Vietnamese / Indonesian
+                        "लोड", "กำลังโหลด", "yükleniyor", "đang tải", "memuat",
+                        # Scandinavian / Finnish
+                        "laddar", "laster", "indlæser", "ladataan",
+                        # Czech / Slovak / Greek
+                        "načítání", "načítanie", "φόρτωση"
+                    ]
+                    current_text_lower = current_text.lower()
+                    is_loading = (
+                        current_len < 500 
+                        and any(phrase in current_text_lower for phrase in loading_phrases)
+                    )
+
+                    # If the page already has content and is not a loading screen, resolve immediately!
+                    if current_len > 0 and not is_loading:
+                        text = current_text
+                    else:
+                        # Otherwise (empty DOM or loading screen), enter dynamic stability loop
+                        import time as time_mod
+                        last_text_len = current_len
+                        start_wait = time_mod.time()
+                        max_wait_seconds = 5.0
+                        while (time_mod.time() - start_wait) < max_wait_seconds:
+                            try:
+                                current_text = page.evaluate('() => document.body ? document.body.innerText : ""')
+                            except Exception:
+                                current_text = ""
+                            current_len = len(current_text)
+                            current_text_lower = current_text.lower()
+                            is_loading = (
+                                current_len < 500 
+                                and any(phrase in current_text_lower for phrase in loading_phrases)
+                            )
+                            if current_len > 0 and current_len == last_text_len and not is_loading:
+                                break
+                            last_text_len = current_len
+                            page.wait_for_timeout(500)
+                        text = current_text
+
+                    if not text:
+                        text = self.evaluator.evaluate(page, browser, response)
                     metadata = {'source': url}
                     yield Document(page_content=text, metadata=metadata)
                 except Exception as e:
@@ -592,21 +687,91 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
 
         async with async_playwright() as p:
             # Use remote browser if ws_endpoint is provided, otherwise use local browser
+            browser_impl = self._get_browser_impl(p)
             if self.playwright_ws_url:
-                browser = await p.chromium.connect(self.playwright_ws_url)
+                browser = await browser_impl.connect(self.playwright_ws_url)
             else:
-                browser = await p.chromium.launch(headless=self.headless, proxy=self.proxy)
+                browser = await browser_impl.launch(headless=self.headless, proxy=self.proxy)
 
             for url in self.urls:
                 try:
                     await self._safe_process_url(url)
                     page = await browser.new_page()
                     await page.route('**/*', self._intercept_navigation)
-                    response = await page.goto(url, timeout=self.playwright_timeout)
+                    # Navigate waiting only for domcontentloaded to get control as fast as possible
+                    response = await page.goto(
+                        url,
+                        timeout=self.playwright_timeout,
+                        wait_until="domcontentloaded",
+                    )
+
                     if response is None:
                         raise ValueError(f'page.goto() returned None for url {url}')
 
-                    text = await self.evaluator.evaluate_async(page, browser, response)
+                    # Get initial text immediately to bypass loop overhead for static pages
+                    try:
+                        current_text = await page.evaluate('() => document.body ? document.body.innerText : ""')
+                    except Exception:
+                        current_text = ""
+
+                    current_len = len(current_text)
+                    loading_phrases = [
+                        # English
+                        "loading", "please wait", "verifying your browser", 
+                        "checking your browser", "just a moment", "one moment",
+                        # Spanish / Portuguese / Italian
+                        "cargando", "carregando", "caricamento", "esperando", "aguarde", "attendere",
+                        # French
+                        "chargement", "patienter",
+                        # German / Dutch
+                        "laden", "warten", "geduld",
+                        # Polish / Russian / Ukrainian
+                        "ładowanie", "загрузка", "подождите", "завантаження",
+                        # Chinese / Japanese / Korean
+                        "加载中", "載入中", "読み込み", "로딩", "기다려",
+                        # Arabic / Hebrew / Persian
+                        "تحميل", "الانتظار", "טועன்", "بارگذاری",
+                        # Hindi / Thai / Turkish / Vietnamese / Indonesian
+                        "लोड", "กำลังโหลด", "yükleniyor", "đang tải", "memuat",
+                        # Scandinavian / Finnish
+                        "laddar", "laster", "indlæser", "ladataan",
+                        # Czech / Slovak / Greek
+                        "načítání", "načítanie", "φόρτωση"
+                    ]
+                    current_text_lower = current_text.lower()
+                    is_loading = (
+                        current_len < 500 
+                        and any(phrase in current_text_lower for phrase in loading_phrases)
+                    )
+
+                    # If the page already has content and is not a loading screen, resolve immediately!
+                    if current_len > 0 and not is_loading:
+                        text = current_text
+                    else:
+                        # Otherwise (empty DOM or loading screen), enter dynamic stability loop
+                        import time as time_mod
+                        last_text_len = current_len
+                        start_wait = time_mod.time()
+                        max_wait_seconds = 5.0
+                        while (time_mod.time() - start_wait) < max_wait_seconds:
+                            try:
+                                current_text = await page.evaluate('() => document.body ? document.body.innerText : ""')
+                            except Exception:
+                                current_text = ""
+                            current_len = len(current_text)
+                            current_text_lower = current_text.lower()
+                            is_loading = (
+                                current_len < 500 
+                                and any(phrase in current_text_lower for phrase in loading_phrases)
+                            )
+                            if current_len > 0 and current_len == last_text_len and not is_loading:
+                                break
+                            last_text_len = current_len
+                            await page.wait_for_timeout(500)
+                        text = current_text
+
+                    if not text:
+                        text = await self.evaluator.evaluate_async(page, browser, response)
                     metadata = {'source': url}
                     yield Document(page_content=text, metadata=metadata)
                 except Exception as e:
@@ -776,6 +941,7 @@ def get_web_loader(
     if WEB_LOADER_ENGINE.value == 'playwright':
         WebLoaderClass = SafePlaywrightURLLoader
         web_loader_args['playwright_timeout'] = PLAYWRIGHT_TIMEOUT.value
+        web_loader_args['playwright_browser_type'] = PLAYWRIGHT_BROWSER_TYPE.value
         if PLAYWRIGHT_WS_URL.value:
             web_loader_args['playwright_ws_url'] = PLAYWRIGHT_WS_URL.value
 
