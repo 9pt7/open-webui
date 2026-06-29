@@ -806,6 +806,13 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         """Safely load URLs asynchronously in parallel."""
         from playwright.async_api import async_playwright
 
+        # Respect requests_per_second as the max concurrent requests limit (concurrency gate)
+        concurrency_limit = 10
+        if self.requests_per_second and self.requests_per_second > 0:
+            concurrency_limit = max(1, int(self.requests_per_second))
+
+        semaphore = asyncio.Semaphore(concurrency_limit)
+
         async with async_playwright() as p:
             # Use remote browser if ws_endpoint is provided, otherwise use local browser
             browser_impl = self._get_browser_impl(p)
@@ -814,7 +821,11 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
             else:
                 browser = await browser_impl.launch(headless=self.headless, proxy=self.proxy)
 
-            tasks = [self._fetch_single_url_async(browser, url) for url in self.urls]
+            async def sem_fetch(url):
+                async with semaphore:
+                    return await self._fetch_single_url_async(browser, url)
+
+            tasks = [sem_fetch(url) for url in self.urls]
             for task in asyncio.as_completed(tasks):
                 doc = await task
                 if doc is not None:
