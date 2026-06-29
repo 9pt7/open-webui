@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Initialize device type args
 # use build args in the docker build command with --build-arg="BUILDARG=true"
 ARG USE_CUDA=false
@@ -37,11 +36,14 @@ WORKDIR /app
 RUN apk add --no-cache git
 
 COPY package.json package-lock.json ./
-RUN npm ci --force
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --force
 
 COPY . .
 ENV APP_BUILD_HASH=${BUILD_HASH}
-RUN npm run build
+RUN --mount=type=cache,target=/app/.svelte-kit \
+    --mount=type=cache,target=/app/node_modules/.cache \
+    npm run build
 
 ######## WebUI backend ########
 FROM python:3.11-slim-bookworm AS base
