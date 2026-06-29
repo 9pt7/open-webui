@@ -776,8 +776,30 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                     raise e
             browser.close()
 
+    async def _fetch_single_url_async(self, browser: Any, url: str) -> Optional[Document]:
+        page = None
+        try:
+            await self._safe_process_url(url)
+            page = await browser.new_page()
+            await page.route('**/*', self._intercept_navigation)
+            response = await page.goto(url, timeout=self.playwright_timeout)
+            if response is None:
+                raise ValueError(f'page.goto() returned None for url {url}')
+
+            text = await self.evaluator.evaluate_async(page, browser, response)
+            metadata = {'source': url}
+            return Document(page_content=text, metadata=metadata)
+        except Exception as e:
+            if self.continue_on_failure:
+                log.exception(f'Error loading {url}: {e}')
+                return None
+            raise e
+        finally:
+            if page:
+                await page.close()
+
     async def alazy_load(self) -> AsyncIterator[Document]:
-        """Safely load URLs asynchronously with support for remote browser."""
+        """Safely load URLs asynchronously in parallel."""
         from playwright.async_api import async_playwright
 
         async with async_playwright() as p:
@@ -788,92 +810,11 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
             else:
                 browser = await browser_impl.launch(headless=self.headless, proxy=self.proxy)
 
-            for url in self.urls:
-                try:
-                    await self._safe_process_url(url)
-                    page = await browser.new_page()
-                    await page.route('**/*', self._intercept_navigation)
-                    # Navigate waiting only for domcontentloaded to get control as fast as possible
-                    response = await page.goto(
-                        url,
-                        timeout=self.playwright_timeout,
-                        wait_until="domcontentloaded",
-                    )
-
-                    if response is None:
-                        raise ValueError(f'page.goto() returned None for url {url}')
-
-                    # Get initial text immediately to bypass loop overhead for static pages
-                    try:
-                        current_text = await page.evaluate('() => document.body ? document.body.innerText : ""')
-                    except Exception:
-                        current_text = ""
-
-                    current_len = len(current_text)
-                    loading_phrases = [
-                        # English
-                        "loading", "please wait", "verifying your browser", 
-                        "checking your browser", "just a moment", "one moment",
-                        # Spanish / Portuguese / Italian
-                        "cargando", "carregando", "caricamento", "esperando", "aguarde", "attendere",
-                        # French
-                        "chargement", "patienter",
-                        # German / Dutch
-                        "laden", "warten", "geduld",
-                        # Polish / Russian / Ukrainian
-                        "ładowanie", "загрузка", "подождите", "завантаження",
-                        # Chinese / Japanese / Korean
-                        "加载中", "載入中", "読み込み", "로딩", "기다려",
-                        # Arabic / Hebrew / Persian
-                        "تحميل", "الانتظار", "טועன்", "بارگذاری",
-                        # Hindi / Thai / Turkish / Vietnamese / Indonesian
-                        "लोड", "กำลังโหลด", "yükleniyor", "đang tải", "memuat",
-                        # Scandinavian / Finnish
-                        "laddar", "laster", "indlæser", "ladataan",
-                        # Czech / Slovak / Greek
-                        "načítání", "načítanie", "φόρτωση"
-                    ]
-                    current_text_lower = current_text.lower()
-                    is_loading = (
-                        current_len < 500 
-                        and any(phrase in current_text_lower for phrase in loading_phrases)
-                    )
-
-                    # If the page already has content and is not a loading screen, resolve immediately!
-                    if current_len > 0 and not is_loading:
-                        text = current_text
-                    else:
-                        # Otherwise (empty DOM or loading screen), enter dynamic stability loop
-                        import time as time_mod
-                        last_text_len = current_len
-                        start_wait = time_mod.time()
-                        max_wait_seconds = 5.0
-                        while (time_mod.time() - start_wait) < max_wait_seconds:
-                            try:
-                                current_text = await page.evaluate('() => document.body ? document.body.innerText : ""')
-                            except Exception:
-                                current_text = ""
-                            current_len = len(current_text)
-                            current_text_lower = current_text.lower()
-                            is_loading = (
-                                current_len < 500 
-                                and any(phrase in current_text_lower for phrase in loading_phrases)
-                            )
-                            if current_len > 0 and current_len == last_text_len and not is_loading:
-                                break
-                            last_text_len = current_len
-                            await page.wait_for_timeout(500)
-                        text = current_text
-
-                    if not text:
-                        text = await self.evaluator.evaluate_async(page, browser, response)
-                    metadata = {'source': url}
-                    yield Document(page_content=text, metadata=metadata)
-                except Exception as e:
-                    if self.continue_on_failure:
-                        log.exception(f'Error loading {url}: {e}')
-                        continue
-                    raise e
+            tasks = [self._fetch_single_url_async(browser, url) for url in self.urls]
+            for task in asyncio.as_completed(tasks):
+                doc = await task
+                if doc is not None:
+                    yield doc
             await browser.close()
 
 
