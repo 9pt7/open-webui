@@ -624,57 +624,87 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         req = request or route.request
 
         if req.resource_type != 'document':
-            route.continue_()
+            try:
+                route.continue_()
+            except Exception:
+                pass
             return
 
         try:
             validate_url(req.url)
         except Exception:
-            route.abort()
+            try:
+                route.abort()
+            except Exception:
+                pass
             return
 
-        if AIOHTTP_CLIENT_ALLOW_REDIRECTS:
-            resp = route.fetch()
-        else:
-            try:
-                resp = route.fetch(max_redirects=0)
-            except TypeError:
-                route.abort()
-                return
+        try:
+            if AIOHTTP_CLIENT_ALLOW_REDIRECTS:
+                resp = route.fetch()
+            else:
+                try:
+                    resp = route.fetch(max_redirects=0)
+                except TypeError:
+                    try:
+                        route.abort()
+                    except Exception:
+                        pass
+                    return
 
-            if 300 <= resp.status < 400:
-                route.abort()
-                return
+                if 300 <= resp.status < 400:
+                    try:
+                        route.abort()
+                    except Exception:
+                        pass
+                    return
 
-        route.fulfill(response=resp)
+            route.fulfill(response=resp)
+        except Exception:
+            pass
 
     async def _intercept_navigation(self, route, request=None):
         req = request or route.request
 
         if req.resource_type != 'document':
-            await route.continue_()
+            try:
+                await route.continue_()
+            except Exception:
+                pass
             return
 
         try:
             await run_in_threadpool(validate_url, req.url)
         except Exception:
-            await route.abort()
+            try:
+                await route.abort()
+            except Exception:
+                pass
             return
 
-        if AIOHTTP_CLIENT_ALLOW_REDIRECTS:
-            resp = await route.fetch()
-        else:
-            try:
-                resp = await route.fetch(max_redirects=0)
-            except TypeError:
-                await route.abort()
-                return
+        try:
+            if AIOHTTP_CLIENT_ALLOW_REDIRECTS:
+                resp = await route.fetch()
+            else:
+                try:
+                    resp = await route.fetch(max_redirects=0)
+                except TypeError:
+                    try:
+                        await route.abort()
+                    except Exception:
+                        pass
+                    return
 
-            if 300 <= resp.status < 400:
-                await route.abort()
-                return
+                if 300 <= resp.status < 400:
+                    try:
+                        await route.abort()
+                    except Exception:
+                        pass
+                    return
 
-        await route.fulfill(response=resp)
+            await route.fulfill(response=resp)
+        except Exception:
+            pass
 
     def lazy_load(self) -> Iterator[Document]:
         """Safely load URLs synchronously with support for remote browser."""
